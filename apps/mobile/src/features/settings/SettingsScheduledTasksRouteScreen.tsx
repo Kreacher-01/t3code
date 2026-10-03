@@ -86,6 +86,7 @@ const DAYS = [
 ] as const;
 
 function describeSchedule(task: ScheduledTask): string {
+  if (task.schedule.type === "webhook") return "On webhook";
   if (task.schedule.type === "interval") return formatScheduledTaskInterval(task.schedule.everyMs);
   const days = task.schedule.weekdays?.length ? repeatLabel(task.schedule.weekdays) : "Every day";
   return `${days} at ${formatTime(task.schedule.timeOfDay)}`;

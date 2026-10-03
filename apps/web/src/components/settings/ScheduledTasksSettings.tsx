@@ -162,6 +162,7 @@ function scheduleFromDraft(draft: DraftState): ScheduledTaskSchedule {
 }
 
 export function scheduleLabel(schedule: ScheduledTaskSchedule): string {
+  if (schedule.type === "webhook") return "On webhook";
   if (schedule.type === "interval") {
     const minutes = schedule.everyMs / 60_000;
     return Number.isInteger(minutes)
