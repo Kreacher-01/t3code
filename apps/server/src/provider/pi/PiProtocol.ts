@@ -37,6 +37,13 @@ export const PiState = Schema.Struct({
   thinkingLevel: Schema.String,
 });
 export const PiMessages = Schema.Struct({ messages: Schema.Array(PiMessage) });
+export const PiPromptResult = Schema.Struct({
+  disposition: Schema.Literals(["started", "handled", "queued"]),
+});
+export const PiCompactionResult = Schema.Struct({
+  tokensBefore: Schema.optional(Schema.Number),
+  estimatedTokensAfter: Schema.optional(Schema.Number),
+});
 
 /** Decode only the native fields used at the adapter boundary. Unknown events remain readable. */
 export const PiRecord = Schema.Struct({
@@ -46,7 +53,7 @@ export const PiRecord = Schema.Struct({
   success: Schema.optional(Schema.Boolean),
   data: Schema.optional(Schema.Unknown),
   error: Schema.optional(Schema.String),
-  message: Schema.optional(PiMessage),
+  message: Schema.optional(Schema.Union([PiMessage, Schema.String])),
   assistantMessageEvent: Schema.optional(
     Schema.Struct({
       type: Schema.String,

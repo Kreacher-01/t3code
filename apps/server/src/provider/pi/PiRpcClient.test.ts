@@ -55,15 +55,19 @@ describe("Pi RPC subprocess", () => {
   it.effect("returns native request errors", () =>
     Effect.gen(function* () {
       const rpc = yield* client();
-      const error = yield* Effect.flip(rpc.request("reject"));
-      expect(error.detail).toBe("Unsupported model");
+      const error = yield* rpc
+        .request("reject")
+        .pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => undefined }));
+      expect(error?.detail).toBe("Unsupported model");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("fails pending requests when the child exits", () =>
     Effect.gen(function* () {
       const rpc = yield* client();
-      const error = yield* Effect.flip(rpc.request("exit"));
-      expect(error.detail).toContain("Pi exited (7)");
+      const error = yield* rpc
+        .request("exit")
+        .pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => undefined }));
+      expect(error?.detail).toContain("Pi exited (7)");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
