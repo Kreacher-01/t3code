@@ -14,7 +14,7 @@ import {
 // external 65/517 MiB fixtures also exercise the production threshold.
 const readTranscriptRecords = (
   path: string,
-  provider: "claude" | "codex" | "grok",
+  provider: "claude" | "codex" | "grok" | "pi",
   position?: TranscriptParsePosition,
 ) => readWithDefaultThreshold(path, provider, position, { streamingThresholdBytes: 256 * 1024 });
 
@@ -27,6 +27,34 @@ afterEach(async () => {
 });
 
 const timestamp = "2026-08-01T10:00:00Z";
+it("reads Pi usage from large messages and incrementally appended records", async () => {
+  const file = NodePath.join(dir, "pi-session.jsonl");
+  const entry = (id: string) =>
+    JSON.stringify({
+      type: "message",
+      id,
+      timestamp,
+      message: {
+        role: "assistant",
+        model: "model",
+        provider: "test",
+        timestamp: 1,
+        content: [{ type: "text", text: "large output".repeat(30000) }],
+        usage: { input: 100, output: 10, cacheRead: 20, cacheWrite: 30, cost: { total: 0.5 } },
+      },
+    });
+  await NodeFSP.writeFile(file, `${entry("first")}\n`);
+  const first = await readTranscriptRecords(file, "pi");
+  if (!first) throw new Error("Missing first Pi transcript result");
+  expect(first.records).toHaveLength(1);
+  expect(first.records[0]?.sessionId).toBe("pi-session.jsonl");
+  expect(first.records[0]?.reportedCostUsd).toBe(0.5);
+  await NodeFSP.appendFile(file, `${entry("second")}\n`);
+  const second = await readTranscriptRecords(file, "pi", first.position);
+  if (!second) throw new Error("Missing appended Pi transcript result");
+  expect(second.records).toHaveLength(1);
+  expect(second.records[0]?.dedupeKey).not.toBe(first.records[0]?.dedupeKey);
+});
 const content = '工具 output \\" usage token_count '.repeat(40_000);
 const claude = (id = "m1", output = 99) => ({
   type: "assistant",

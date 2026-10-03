@@ -7,6 +7,8 @@
  * @module usageTranscripts
  */
 import type { UsageProviderKind, UsageTokenTotals } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 
 export interface UsageRecord {
   readonly provider: UsageProviderKind;
@@ -78,9 +80,62 @@ export function totalTokens(totals: UsageTokenTotals): number {
  * an order of magnitude.
  */
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
+  if (provider === "pi") return line.includes('"usage"');
   if (provider === "claude") return line.includes('"usage"');
   if (provider === "grok") return line.includes('"turn_completed"');
   return line.includes('"token_count"');
+}
+
+const PiUsageEntry = Schema.Struct({
+  type: Schema.Literal("message"),
+  id: Schema.String,
+  timestamp: Schema.String,
+  message: Schema.Struct({
+    role: Schema.Literal("assistant"),
+    model: Schema.String,
+    provider: Schema.String,
+    timestamp: Schema.optional(Schema.Number),
+    usage: Schema.Struct({
+      input: Schema.Number,
+      output: Schema.Number,
+      cacheRead: Schema.Number,
+      cacheWrite: Schema.Number,
+      cost: Schema.optional(Schema.Struct({ total: Schema.Number })),
+    }),
+  }),
+});
+const decodePiUsageEntry = Schema.decodeUnknownOption(PiUsageEntry);
+const decodePiUsageLine = Schema.decodeOption(Schema.fromJsonString(PiUsageEntry));
+export function parsePiRecord(value: unknown, sessionId: string): UsageRecord | null {
+  const entry = Option.getOrUndefined(decodePiUsageEntry(value));
+  return entry ? piUsageRecord(entry, sessionId) : null;
+}
+export function parsePiLine(line: string, sessionId: string): UsageRecord | null {
+  const entry = Option.getOrUndefined(decodePiUsageLine(line));
+  return entry ? piUsageRecord(entry, sessionId) : null;
+}
+function piUsageRecord(entry: typeof PiUsageEntry.Type, sessionId: string): UsageRecord | null {
+  const timestampMs = parseTimestampMs(entry.timestamp);
+  if (timestampMs === null) return null;
+  const { message } = entry;
+  const cost = message.usage.cost?.total;
+  return {
+    provider: "pi",
+    timestampMs,
+    model: message.model,
+    sessionId,
+    totals: {
+      uncachedInputTokens: int(message.usage.input),
+      cachedInputTokens: int(message.usage.cacheRead),
+      cacheCreationTokens: int(message.usage.cacheWrite),
+      outputTokens: int(message.usage.output),
+      reasoningTokens: 0,
+    },
+    reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : null,
+    fast: false,
+    // Forks copy ancestors. The message's original timestamp survives a rewritten entry timestamp.
+    dedupeKey: `${message.provider}:${message.model}:${message.timestamp ?? entry.timestamp}:${entry.id}`,
+  };
 }
 
 /**

@@ -17,6 +17,7 @@ import * as NodeOS from "node:os";
 import {
   ClaudeSettings,
   CodexSettings,
+  PiSettings,
   type ProviderInstanceConfig,
   ProviderInstanceId,
   USAGE_CONTRACT_VERSION,
@@ -90,6 +91,7 @@ const CACHE_RETENTION_DAYS = 90;
 
 const decodeCodexSettings = Schema.decodeOption(CodexSettings);
 const decodeClaudeSettings = Schema.decodeOption(ClaudeSettings);
+const decodePiSettings = Schema.decodeOption(PiSettings);
 
 /** On-disk shape of the rate snapshot. */
 const RatesCacheFile = Schema.Struct({
@@ -350,6 +352,25 @@ export const make = Effect.gen(function* () {
         });
       }
     }
+    // T3-owned Pi conversations persist separately from the user's native CLI history.
+    const piRoots = new Set<string>([path.join(config.stateDir, "pi")]);
+    for (const instance of Object.values(settings.providerInstances)) {
+      if (instance.driver !== "pi") continue;
+      const env = mergeProviderInstanceEnvironment(instance.environment, hostEnvironment);
+      const decoded = decodePiSettings(instance.config ?? {});
+      if (Option.isNone(decoded)) continue;
+      const agentDir =
+        decoded.value.agentDir.trim() ||
+        env.PI_CODING_AGENT_DIR?.trim() ||
+        path.join(env.HOME ?? env.USERPROFILE ?? NodeOS.homedir(), ".pi", "agent");
+      piRoots.add(path.resolve(expandHomePath(agentDir), "sessions"));
+    }
+    for (const dir of piRoots)
+      dirs.push({
+        provider: "pi",
+        dir,
+        volumeId: yield* Effect.promise(() => readDirectoryVolumeId(dir)),
+      });
     return dirs;
   });
 

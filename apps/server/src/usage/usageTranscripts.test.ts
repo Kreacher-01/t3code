@@ -6,8 +6,41 @@ import {
   parseClaudeLine,
   parseCodexLine,
   parseGrokLine,
+  parsePiRecord,
   totalTokens,
 } from "./usageTranscripts.ts";
+
+describe("Pi usage", () => {
+  const entry = {
+    type: "message",
+    id: "message-1",
+    timestamp: "2026-10-03T00:00:00Z",
+    message: {
+      role: "assistant",
+      provider: "test",
+      model: "model",
+      timestamp: 123,
+      usage: { input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: { total: 0.25 } },
+    },
+  };
+  it("keeps cache reads and writes disjoint and preserves reported cost", () => {
+    const usage = parsePiRecord(entry, "session-1");
+    expect(usage?.provider).toBe("pi");
+    expect(usage?.reportedCostUsd).toBe(0.25);
+    expect(usage?.sessionId).toBe("session-1");
+    expect(usage && totalTokens(usage.totals)).toBe(100);
+    expect(usage?.dedupeKey).toBe(
+      parsePiRecord({ ...entry, timestamp: "2026-10-03T01:00:00Z" }, "fork")?.dedupeKey,
+    );
+  });
+  it("ignores user messages and malformed records", () => {
+    expect(
+      parsePiRecord({ ...entry, message: { ...entry.message, role: "user" } }, "session"),
+    ).toBeNull();
+    expect(parsePiRecord({ ...entry, timestamp: "invalid" }, "session")).toBeNull();
+    expect(parsePiRecord({ type: "message" }, "session")).toBeNull();
+  });
+});
 
 /** Shaped after a real Claude Code assistant record. */
 function claudeLine(overrides: {

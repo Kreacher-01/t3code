@@ -32,6 +32,8 @@ import {
   parseCodexRecord,
   parseGrokLine,
   parseGrokRecord,
+  parsePiLine,
+  parsePiRecord,
   type CodexScanState,
   type UsageRecord,
 } from "./usageTranscripts.ts";
@@ -91,7 +93,13 @@ type SelectedFields = { readonly [key: string]: true | SelectedFields };
 
 // Keep the fields consumed by usageTranscripts, including reducer state and
 // dedupe/cost metadata. A selected subtree (usage) keeps future token fields.
-const USAGE_FIELDS: Record<"claude" | "codex" | "grok", SelectedFields> = {
+const USAGE_FIELDS: Record<"claude" | "codex" | "grok" | "pi", SelectedFields> = {
+  pi: {
+    type: true,
+    id: true,
+    timestamp: true,
+    message: { role: true, model: true, provider: true, timestamp: true, usage: true },
+  },
   claude: {
     type: true,
     timestamp: true,
@@ -124,7 +132,10 @@ const USAGE_FIELDS: Record<"claude" | "codex" | "grok", SelectedFields> = {
 };
 
 function selectUsageFields(provider: UsageProviderKind) {
-  const fields = USAGE_FIELDS[provider === "codex" || provider === "grok" ? provider : "claude"];
+  const fields =
+    USAGE_FIELDS[
+      provider === "codex" || provider === "grok" || provider === "pi" ? provider : "claude"
+    ];
   return (path: ReadonlyArray<string | number | null>): boolean => {
     let selected: true | SelectedFields = fields;
     for (const key of path) {
@@ -292,6 +303,11 @@ export async function readTranscriptRecords(
         return;
       }
       if (!mightCarryUsage(line, provider)) return;
+      if (provider === "pi") {
+        const record = parsePiLine(line, NodePath.basename(filePath));
+        if (record) out.push(record);
+        return;
+      }
       if (provider === "grok") {
         for (const grokRecord of parseGrokLine(line)) out.push(grokRecord);
         return;
@@ -340,7 +356,10 @@ export async function readTranscriptRecords(
       if (streaming) {
         streaming.write(decoder!.end());
         const projected = streaming.finish();
-        if (provider === "grok") {
+        if (provider === "pi") {
+          const record = parsePiRecord(projected, NodePath.basename(filePath));
+          if (record) out.push(record);
+        } else if (provider === "grok") {
           out.push(...parseGrokRecord(projected));
         } else {
           const record =
