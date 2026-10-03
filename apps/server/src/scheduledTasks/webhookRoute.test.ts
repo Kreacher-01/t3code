@@ -102,7 +102,7 @@ describe("webhook route", () => {
         new Request("http://env.local/api/hooks/id/tok", {
           method: "POST",
           body: chunked,
-          // @ts-expect-error Node's fetch needs duplex for streamed bodies.
+          // Node's fetch needs duplex for streamed bodies.
           duplex: "half",
         }),
       );
