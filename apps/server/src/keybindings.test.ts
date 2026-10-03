@@ -283,6 +283,30 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
       }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
+  it.effect("adds a late default to an existing command once", () =>
+    Effect.gen(function* () {
+      const { keybindingsConfigPath } = yield* ServerConfig.ServerConfig;
+      const keybindings = yield* Keybindings.Keybindings;
+      const when = "composerFocus && draftThreadRoute";
+      const existing = { key: "mod+alt+enter", command: "composer.sendBackground", when } as const;
+      const backgroundRules = Effect.map(readKeybindingsConfig(keybindingsConfigPath), (rules) =>
+        rules.filter((entry) => entry.command === "composer.sendBackground"),
+      );
+      yield* writeKeybindingsConfig(keybindingsConfigPath, [existing]);
+
+      yield* keybindings.syncDefaultKeybindingsOnStartup;
+      assert.deepStrictEqual(yield* backgroundRules, [
+        existing,
+        { key: "mod+enter", command: "composer.sendBackground", when },
+      ]);
+
+      // Removing the added rule later must survive the next startup.
+      yield* writeKeybindingsConfig(keybindingsConfigPath, [existing]);
+      yield* keybindings.syncDefaultKeybindingsOnStartup;
+      assert.deepStrictEqual(yield* backgroundRules, [existing]);
+    }).pipe(Effect.provide(makeKeybindingsLayer())),
+  );
+
   it.effect("skips conflicting default keybindings on startup and logs a detailed warning", () => {
     const messages: string[] = [];
     const logger = Logger.make(({ message }) => {

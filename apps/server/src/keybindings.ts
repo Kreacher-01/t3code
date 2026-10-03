@@ -104,6 +104,24 @@ function isSameKeybindingRule(left: KeybindingRule, right: KeybindingRule): bool
   );
 }
 
+// Default rules added to a command after startup sync had already persisted
+// that command. Backfill skips commands a config already has, so startup
+// appends each rule here once per config and records its id. A user who later
+// removes the rule keeps it removed.
+const LATE_DEFAULT_KEYBINDINGS: ReadonlyArray<{
+  readonly id: string;
+  readonly rule: KeybindingRule;
+}> = [
+  {
+    id: "composer.sendBackground:mod+enter",
+    rule: {
+      key: "mod+enter",
+      command: "composer.sendBackground",
+      when: "composerFocus && draftThreadRoute",
+    },
+  },
+];
+
 function keybindingShortcutContext(rule: KeybindingRule): string | null {
   const parsed = parseKeybindingShortcut(rule.key);
   if (!parsed) return null;
@@ -399,6 +417,31 @@ const make = Effect.gen(function* () {
     return { keybindings, issues };
   });
 
+  // One applied migration id per line, next to the config file.
+  const appliedMigrationsPath = path.join(
+    path.dirname(keybindingsConfigPath),
+    "keybindings-migrations",
+  );
+  const readAppliedMigrationIds = fs.readFileString(appliedMigrationsPath).pipe(
+    Effect.map((contents) => new Set(contents.split("\n").filter((line) => line.length > 0))),
+    Effect.orElseSucceed(() => new Set<string>()),
+  );
+  const recordAppliedMigrations = writeFileStringAtomically({
+    filePath: appliedMigrationsPath,
+    contents: `${LATE_DEFAULT_KEYBINDINGS.map((late) => late.id).join("\n")}\n`,
+  }).pipe(
+    Effect.provideService(FileSystem.FileSystem, fs),
+    Effect.provideService(Path.Path, path),
+    Effect.mapError(
+      (cause) =>
+        new KeybindingsConfigError({
+          configPath: keybindingsConfigPath,
+          detail: "failed to record keybinding migrations",
+          cause,
+        }),
+    ),
+  );
+
   const writeConfigAtomically = (rules: readonly KeybindingRule[]) => {
     return encodeKeybindingsConfigPrettyJson(rules).pipe(
       Effect.map((encoded) => `${encoded}\n`),
@@ -450,9 +493,14 @@ const make = Effect.gen(function* () {
 
   const syncDefaultKeybindingsOnStartup = upsertSemaphore.withPermits(1)(
     Effect.gen(function* () {
+      const appliedMigrationIds = yield* readAppliedMigrationIds;
+      const pendingLateDefaults = LATE_DEFAULT_KEYBINDINGS.filter(
+        (late) => !appliedMigrationIds.has(late.id),
+      );
       const configExists = yield* readConfigExists;
       if (!configExists) {
         yield* writeConfigAtomically(DEFAULT_KEYBINDINGS);
+        if (pendingLateDefaults.length > 0) yield* recordAppliedMigrations;
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
@@ -496,6 +544,16 @@ const make = Effect.gen(function* () {
         }
         missingDefaults.push(defaultRule);
       }
+      // The loop above backfills whole missing commands. Late defaults join
+      // commands the config already has, when their shortcut is still free.
+      for (const { rule } of pendingLateDefaults) {
+        if (
+          existingCommands.has(rule.command) &&
+          !customConfig.some((entry) => hasSameShortcutContext(entry, rule))
+        ) {
+          missingDefaults.push(rule);
+        }
+      }
       for (const conflict of shortcutConflictWarnings) {
         yield* Effect.logWarning("skipping default keybinding due to shortcut conflict", {
           path: keybindingsConfigPath,
@@ -506,21 +564,18 @@ const make = Effect.gen(function* () {
           reason: "shortcut context already used by existing rule",
         });
       }
-      if (missingDefaults.length === 0) {
-        yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
-        return;
-      }
-
-      const matchingDefaults = Array.filterMap(DEFAULT_KEYBINDINGS, (defaultRule) =>
-        customConfig.some((entry) => isSameKeybindingRule(entry, defaultRule))
-          ? Result.succeed(defaultRule.command)
-          : Result.failVoid,
-      );
-      if (matchingDefaults.length > 0) {
-        yield* Effect.logWarning("default keybinding rule already defined in user config", {
-          path: keybindingsConfigPath,
-          commands: matchingDefaults,
-        });
+      if (missingDefaults.length > 0) {
+        const matchingDefaults = Array.filterMap(DEFAULT_KEYBINDINGS, (defaultRule) =>
+          customConfig.some((entry) => isSameKeybindingRule(entry, defaultRule))
+            ? Result.succeed(defaultRule.command)
+            : Result.failVoid,
+        );
+        if (matchingDefaults.length > 0) {
+          yield* Effect.logWarning("default keybinding rule already defined in user config", {
+            path: keybindingsConfigPath,
+            commands: matchingDefaults,
+          });
+        }
       }
 
       // Startup backfill must never evict persisted user rules: append only
@@ -535,12 +590,10 @@ const make = Effect.gen(function* () {
           commands: skippedDefaults.map((rule) => rule.command),
         });
       }
-      if (defaultsToAppend.length === 0) {
-        yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
-        return;
+      if (defaultsToAppend.length > 0) {
+        yield* writeConfigAtomically([...customConfig, ...defaultsToAppend]);
       }
-
-      yield* writeConfigAtomically([...customConfig, ...defaultsToAppend]);
+      if (pendingLateDefaults.length > 0) yield* recordAppliedMigrations;
       yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
     }),
   );
