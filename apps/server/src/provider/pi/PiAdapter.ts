@@ -48,6 +48,7 @@ import {
   PiPromptResult,
   PiState,
   piModelSlug,
+  piMessageText,
   type PiRecord,
 } from "./PiProtocol.ts";
 import { makePiRpcClient, type PiRpcClient } from "./PiRpcClient.ts";
@@ -73,6 +74,9 @@ const decodeToolContent = Schema.decodeUnknownOption(
     ),
   }),
 );
+const decodeToolArgs = Schema.decodeUnknownOption(
+  Schema.Struct({ command: Schema.optional(Schema.String), path: Schema.optional(Schema.String) }),
+);
 type EventBody<E = ProviderRuntimeEvent> = E extends ProviderRuntimeEvent
   ? Omit<E, "eventId" | "provider" | "providerInstanceId" | "threadId" | "createdAt">
   : never;
@@ -84,12 +88,15 @@ interface MessageItem {
 interface PendingDialog {
   readonly native: PiRecord;
   readonly approval: boolean;
+  readonly turnId: TurnId | undefined;
 }
 interface SessionContext {
   readonly scope: Scope.Closeable;
   readonly rpc: PiRpcClient;
   readonly lock: Semaphore.Semaphore;
   readonly ready: Deferred.Deferred<void, ProviderAdapterRequestError>;
+  drain: Deferred.Deferred<void, ProviderAdapterRequestError>;
+  draining: boolean;
   readonly requests: Map<ApprovalRequestId, PendingDialog>;
   readonly items: Map<number, MessageItem>;
   readonly tools: Map<string, { readonly name: string; readonly args: unknown }>;
@@ -144,7 +151,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const config = yield* ServerConfig;
   const sessions = new Map<ThreadId, SessionContext>();
   const startLock = yield* Semaphore.make(1);
-  const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const events = yield* Effect.acquireRelease(
+    PubSub.unbounded<ProviderRuntimeEvent>(),
+    PubSub.shutdown,
+  );
   const now = Effect.map(DateTime.now, DateTime.formatIso);
   const error = (method: string, detail: string, cause?: unknown) =>
     new ProviderAdapterRequestError({
@@ -225,6 +235,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       if (dialog.approval)
         yield* emit(context, {
           type: "request.resolved",
+          turnId: dialog.turnId,
           requestId: RuntimeRequestId.make(requestId),
           payload: {
             requestType: "permission_approval",
@@ -234,6 +245,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       else
         yield* emit(context, {
           type: "user-input.resolved",
+          turnId: dialog.turnId,
           requestId: RuntimeRequestId.make(requestId),
           payload: { answers: answer ?? {} },
         });
@@ -246,12 +258,37 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     );
   const finishTurn = (context: SessionContext, failure?: string) =>
     Effect.gen(function* () {
-      if (!context.turnId) return;
+      const turnId = context.turnId;
+      if (!turnId) return;
+      // Claim settlement before yielding: a rejected prompt and a process exit can race.
+      context.turnId = undefined;
       yield* cancelDialogs(context);
       const usage = context.usage;
       const errorMessage = failure ?? context.error;
+      for (const item of context.items.values())
+        yield* emit(context, {
+          type: "item.completed",
+          turnId,
+          itemId: item.id,
+          payload: {
+            itemType: item.type,
+            status: context.interrupted || failure ? "failed" : "completed",
+          },
+        });
+      for (const [id, tool] of context.tools)
+        yield* emit(context, {
+          type: "item.completed",
+          turnId,
+          itemId: RuntimeItemId.make(id),
+          payload: {
+            itemType: toolType(tool.name),
+            title: tool.name,
+            status: context.interrupted ? "declined" : "failed",
+          },
+        });
       yield* emit(context, {
         type: "turn.completed",
+        turnId,
         payload: {
           state: context.interrupted ? "interrupted" : errorMessage ? "failed" : "completed",
           ...(errorMessage ? { errorMessage } : {}),
@@ -269,7 +306,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             : { usageScope: "main_agent", usageStatus: "unavailable", hasSubagents: false },
         },
       });
-      context.turnId = undefined;
       context.items.clear();
       context.tools.clear();
       context.session = {
@@ -283,6 +319,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         type: "session.state.changed",
         payload: { state: failure ? "error" : "ready" },
       });
+      yield* Deferred.succeed(context.drain, undefined);
     });
   const stopContext = (context: SessionContext) =>
     Effect.gen(function* () {
@@ -324,16 +361,15 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         });
       }
       item.text += delta;
+      if (type === "plan") {
+        yield* emit(context, { type: "turn.proposed.delta", payload: { delta } });
+        return;
+      }
       yield* emit(context, {
         type: "content.delta",
         itemId: item.id,
         payload: {
-          streamKind:
-            type === "reasoning"
-              ? "reasoning_text"
-              : type === "plan"
-                ? "plan_text"
-                : "assistant_text",
+          streamKind: type === "reasoning" ? "reasoning_text" : "assistant_text",
           delta,
           contentIndex: index,
         },
@@ -350,6 +386,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       if (record.type === "t3_process_exit") {
         const detail = record.error ?? "Pi process stopped.";
         yield* Deferred.fail(context.ready, error("startSession", detail));
+        yield* Deferred.fail(context.drain, error("drain", detail));
         yield* finishTurn(context, detail);
         context.session = {
           ...context.session,
@@ -373,7 +410,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         // Scope to this process: native request IDs alone may collide across instances.
         const requestId = yield* importApprovalId(record.id);
         const approval = record.method === "confirm";
-        context.requests.set(requestId, { native: record, approval });
+        context.requests.set(requestId, { native: record, approval, turnId: context.turnId });
         if (approval)
           yield* emit(context, {
             type: "request.opened",
@@ -436,7 +473,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       if (record.type === "auto_retry_start") context.error = undefined;
       if (!context.turnId) return;
       if (record.type === "agent_settled") {
-        yield* finishTurn(context);
+        if (context.draining) yield* Deferred.succeed(context.drain, undefined);
+        else yield* finishTurn(context);
         return;
       }
       const message = typeof record.message === "string" ? undefined : record.message;
@@ -490,6 +528,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             },
           });
         context.turns.at(-1)?.items.push(message);
+        const planMarkdown =
+          context.plan && message.stopReason === "stop" ? piMessageText(message).trim() : "";
+        if (planMarkdown)
+          yield* emit(context, { type: "turn.proposed.completed", payload: { planMarkdown } });
+        context.items.clear();
         if (message.stopReason === "error")
           context.error = message.errorMessage || "Pi model request failed.";
         else if (message.stopReason === "aborted") context.interrupted = true;
@@ -519,6 +562,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         if (record.type === "tool_execution_start")
           context.tools.set(id, { name: record.toolName ?? "tool", args: record.args });
         const tool = context.tools.get(id);
+        const args = Option.getOrUndefined(decodeToolArgs(tool?.args ?? record.args));
         const name = record.toolName ?? tool?.name ?? "tool";
         const result =
           record.type === "tool_execution_update" ? record.partialResult : record.result;
@@ -541,9 +585,17 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
                   : "completed"
                 : "inProgress",
             ...(detail ? { detail: detail.slice(0, 32000) } : {}),
-            data: { toolName: name, args: tool?.args ?? record.args, result },
+            data: {
+              toolCallId: id,
+              toolName: name,
+              command: args?.command,
+              path: args?.path,
+              rawInput: tool?.args ?? record.args,
+              rawOutput: result,
+            },
           },
         });
+        if (record.type === "tool_execution_end") context.tools.delete(id);
       }
     });
   // Branding is a boundary operation, while native IDs stay opaque.
@@ -556,6 +608,13 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     startLock.withPermit(
       Effect.gen(function* () {
         yield* validateSelection(input.modelSelection);
+        if (input.sandboxMode && input.sandboxMode !== "danger-full-access")
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue:
+              "Pi does not provide an OS sandbox. Use T3 tool approvals or configure an external sandbox.",
+          });
         if (input.providerInstanceId && input.providerInstanceId !== options.instanceId)
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -621,6 +680,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             rpc,
             lock: yield* Semaphore.make(1),
             ready: yield* Deferred.make<void, ProviderAdapterRequestError>(),
+            drain: yield* Deferred.make<void, ProviderAdapterRequestError>(),
+            draining: false,
             requests: new Map(),
             items: new Map(),
             tools: new Map(),
@@ -696,20 +757,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       const context = yield* requireSession(input.threadId);
       return yield* context.lock.withPermit(
         Effect.gen(function* () {
-          yield* setModel(context, input.modelSelection);
+          yield* validateSelection(input.modelSelection);
           const planning = input.interactionMode === "plan";
-          if (planning !== context.plan) {
-            if (context.turnId)
-              return yield* new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "sendTurn",
-                issue: "Wait for the Pi turn to finish before changing interaction mode.",
-              });
-            yield* context.rpc.request("prompt", {
-              message: `/t3-mode ${planning ? "plan" : "default"}`,
-            });
-            context.plan = planning;
-          }
           const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
           const files: string[] = [];
           for (const attachment of input.attachments ?? []) {
@@ -750,6 +799,67 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               operation: "sendTurn",
               issue: "Pi requires a message or an attachment.",
             });
+          if (!context.turnId && context.session.status === "running")
+            yield* Deferred.await(context.drain);
+          if (context.stopped)
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          if (context.turnId) {
+            // Abort and drain before reprompting, preserving the T3 turn identity.
+            // Native prompt(..., steer) can start a new run as the previous one settles.
+            context.draining = true;
+            yield* Effect.gen(function* () {
+              yield* cancelDialogs(context);
+              yield* context.rpc.request("clear_queue");
+              yield* context.rpc.request("abort");
+              yield* Deferred.await(context.drain).pipe(
+                Effect.timeoutOrElse({
+                  duration: "30 seconds",
+                  orElse: () =>
+                    Effect.fail(error("drain", "Pi did not settle after interruption.")),
+                }),
+              );
+              for (const item of context.items.values())
+                yield* emit(context, {
+                  type: "item.completed",
+                  itemId: item.id,
+                  payload: { itemType: item.type, status: "failed" },
+                });
+              context.items.clear();
+              for (const [id, tool] of context.tools)
+                yield* emit(context, {
+                  type: "item.completed",
+                  itemId: RuntimeItemId.make(id),
+                  payload: { itemType: toolType(tool.name), status: "declined", title: tool.name },
+                });
+              context.tools.clear();
+              context.interrupted = false;
+              context.error = undefined;
+            }).pipe(
+              Effect.tapError((cause) => finishTurn(context, cause.message)),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  context.draining = false;
+                }),
+              ),
+            );
+          }
+          yield* setModel(context, input.modelSelection).pipe(
+            Effect.tapError((cause) => finishTurn(context, cause.message)),
+          );
+          if (planning !== context.plan) {
+            yield* context.rpc
+              .request("prompt", { message: `/t3-mode ${planning ? "plan" : "default"}` })
+              .pipe(Effect.tapError((cause) => finishTurn(context, cause.message)));
+            context.plan = planning;
+          }
+          if (context.stopped)
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
           const alreadyRunning = context.turnId !== undefined;
           const turnId = context.turnId ?? TurnId.make(yield* randomId);
           if (!alreadyRunning) {
@@ -777,20 +887,20 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             });
             yield* emit(context, { type: "session.state.changed", payload: { state: "running" } });
           }
+          context.drain = yield* Deferred.make<void, ProviderAdapterRequestError>();
           const result = yield* context.rpc
             .request("prompt", {
               message,
               ...(images.length ? { images } : {}),
-              ...(alreadyRunning ? { streamingBehavior: "steer" } : {}),
             })
             .pipe(
               Effect.flatMap(decodePromptResult),
-              Effect.mapError((cause) => error("prompt", "Pi rejected the prompt.", cause)),
-              Effect.tapError((failure) =>
-                alreadyRunning ? Effect.void : finishTurn(context, failure.detail),
+              Effect.mapError((cause) =>
+                isRequestError(cause) ? cause : error("prompt", "Pi rejected the prompt.", cause),
               ),
+              Effect.tapError((failure) => finishTurn(context, failure.detail)),
             );
-          if (result.disposition === "handled" && !alreadyRunning) yield* finishTurn(context);
+          if (result.disposition === "handled") yield* finishTurn(context);
           return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
         }),
       );
@@ -802,7 +912,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     sendTurn,
     compaction: {
       type: "native",
-      start: (threadId, selection) =>
+      start: (threadId: ThreadId, selection?: ModelSelection) =>
         Effect.gen(function* () {
           const context = yield* requireSession(threadId);
           yield* context.lock.withPermit(
@@ -819,7 +929,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           );
         }),
     },
-    interruptTurn: (threadId, turnId) =>
+    interruptTurn: (threadId: ThreadId, turnId?: TurnId) =>
       Effect.gen(function* () {
         const context = yield* requireSession(threadId);
         if (turnId && context.turnId !== turnId) return;
@@ -868,7 +978,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       startLock.withPermit(requireSession(threadId).pipe(Effect.flatMap(stopContext))),
     stopAll,
     listSessions: () => Effect.sync(() => [...sessions.values()].map((context) => context.session)),
-    hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
+    hasSession: (threadId) =>
+      Effect.sync(() => {
+        const context = sessions.get(threadId);
+        return context !== undefined && !context.stopped && context.session.status !== "error";
+      }),
     readThread: (threadId) =>
       requireSession(threadId).pipe(Effect.map((context) => ({ threadId, turns: context.turns }))),
     rollbackThread: () =>

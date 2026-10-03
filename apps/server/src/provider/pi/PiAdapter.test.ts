@@ -8,6 +8,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -97,10 +98,82 @@ const harness = Effect.gen(function* () {
         if (event.type === type) return event;
       }
     });
-  return { adapter, collected, next, fs };
+  return { adapter, collected, next, fs, binaryPath };
 });
 
 describe.skipIf(HostProcessPlatform.defaultValue() === "win32")("Pi adapter", () => {
+  it.effect("drains an in-flight run before steering the same T3 turn", () =>
+    Effect.gen(function* () {
+      const { adapter, next, collected } = yield* harness;
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const first = yield* adapter.sendTurn({ threadId, input: "wait" });
+      const steered = yield* adapter.sendTurn({ threadId, input: "continue" });
+      expect(steered.turnId).toBe(first.turnId);
+      expect((yield* next("turn.completed")).payload).toMatchObject({ state: "completed" });
+      expect(collected.filter((event) => event.type === "turn.started")).toHaveLength(1);
+      expect(collected.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.effect("stops one active instance without interrupting another instance's thread", () =>
+    Effect.gen(function* () {
+      const first = yield* harness;
+      const second = yield* makePiAdapter(decodeSettings({ binaryPath: first.binaryPath }), {
+        instanceId: ProviderInstanceId.make("pi-second"),
+        environment: process.env,
+      });
+      const settled = yield* Deferred.make<void>();
+      let completed = false;
+      yield* second.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            if (event.type === "turn.completed") completed = true;
+            if (
+              completed &&
+              event.type === "session.state.changed" &&
+              event.payload.state === "ready"
+            )
+              yield* Deferred.succeed(settled, undefined);
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      const one = yield* first.adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const two = yield* second.startSession({ threadId, runtimeMode: "full-access" });
+      expect(one.resumeCursor).not.toEqual(two.resumeCursor);
+      yield* second.sendTurn({ threadId, input: "wait" });
+      yield* first.adapter.stopAll();
+      expect(yield* second.hasSession(threadId)).toBe(true);
+      yield* second.interruptTurn(threadId);
+      yield* Deferred.await(settled);
+      expect((yield* second.listSessions())[0]?.status).toBe("ready");
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.effect("settles a crashing turn once and releases a stopped session", () =>
+    Effect.gen(function* () {
+      const { adapter, next, collected } = yield* harness;
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const failure = yield* adapter
+        .sendTurn({ threadId, input: "crash" })
+        .pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => undefined }));
+      expect(failure?._tag).toBe("ProviderAdapterRequestError");
+      expect((yield* next("turn.completed")).payload).toMatchObject({ state: "failed" });
+      expect((yield* next("session.exited")).payload).toMatchObject({ exitKind: "error" });
+      expect(collected.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+      yield* adapter.stopSession(threadId);
+      expect(yield* adapter.hasSession(threadId)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.effect("rejects a sandbox requirement that Pi cannot enforce", () =>
+    Effect.gen(function* () {
+      const { adapter } = yield* harness;
+      const failure = yield* adapter
+        .startSession({ threadId, runtimeMode: "approval-required", sandboxMode: "read-only" })
+        .pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => undefined }));
+      expect(failure?._tag).toBe("ProviderAdapterValidationError");
+      expect(yield* adapter.hasSession(threadId)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
   it.effect("streams complete messages and resumes the same native session file", () =>
     Effect.gen(function* () {
       const { adapter, next, collected } = yield* harness;

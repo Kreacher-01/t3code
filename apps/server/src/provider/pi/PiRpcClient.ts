@@ -45,8 +45,8 @@ export const makePiRpcClient = Effect.fn("makePiRpcClient")(function* (input: {
         error("spawn", "Could not start Pi. Check its binary path.", cause),
       ),
     );
-  const outgoing = yield* Queue.unbounded<Uint8Array>();
-  const events = yield* Queue.unbounded<PiRecord>();
+  const outgoing = yield* Effect.acquireRelease(Queue.unbounded<Uint8Array>(), Queue.shutdown);
+  const events = yield* Effect.acquireRelease(Queue.unbounded<PiRecord>(), Queue.shutdown);
   const pending = new Map<string, Deferred.Deferred<unknown, ProviderAdapterRequestError>>();
   let nextId = 0;
   let closed: ProviderAdapterRequestError | undefined;
