@@ -2,6 +2,18 @@ import React, { type SVGProps, useId } from "react";
 import { cn } from "~/lib/utils";
 export type Icon = React.FC<SVGProps<SVGSVGElement>>;
 
+export const PiIcon: Icon = (props) => (
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" {...props}>
+    <path
+      d="M3 8c1-2 2-3 5-3h13M8 5v7c0 4-1 6-3 8M16 5v12c0 3 3 3 5 1"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
 export const UltrafastIcon: Icon = (props) => (
   <svg viewBox="0 0 24 24" fill="currentColor" {...props}>
     <path d="m17 2-10 12h7l-1 8 10-12h-7l1-8Z" opacity="0.4" />
