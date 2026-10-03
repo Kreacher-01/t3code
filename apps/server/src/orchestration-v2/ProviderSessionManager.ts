@@ -793,6 +793,48 @@ export const layerWithOptions = (
             ),
           );
 
+      // Removes the live entry and reads the request cleanup cutoff while
+      // holding the entry's request permit. A request the event pump is
+      // persisting for this runtime lands before the cutoff, and once the
+      // entry is gone the pump persists no more for it. A replacement's
+      // requests come after its own open.
+      const removeLiveEntry = (input: {
+        readonly providerSessionId: ProviderSessionId;
+        readonly onlyIfIdleGeneration?: number;
+      }): Effect.Effect<readonly [Option.Option<LiveSessionEntry>, DateTime.Utc]> =>
+        Effect.gen(function* () {
+          const key = sessionKey(input.providerSessionId);
+          const candidate = (yield* Ref.get(sessions)).get(key);
+          if (candidate === undefined) {
+            return [Option.none<LiveSessionEntry>(), yield* DateTime.now] as const;
+          }
+          const removed = yield* Effect.zip(
+            Ref.modify(sessions, (current) => {
+              const existing = current.get(key);
+              if (existing !== candidate) {
+                return [existing === undefined ? "gone" : "changed", current] as const;
+              }
+              if (
+                input.onlyIfIdleGeneration !== undefined &&
+                (existing.busyCount > 0 || existing.idleGeneration !== input.onlyIfIdleGeneration)
+              ) {
+                return ["kept", current] as const;
+              }
+              const updated = new Map(current);
+              updated.delete(key);
+              return ["removed", updated] as const;
+            }),
+            DateTime.now,
+          ).pipe(candidate.requestEventPermit.withPermits(1));
+          const [outcome, releasedAt] = removed;
+          // Another entry took this id while the permit was held; release it instead.
+          if (outcome === "changed") return yield* removeLiveEntry(input);
+          return [
+            outcome === "removed" ? Option.some(candidate) : Option.none<LiveSessionEntry>(),
+            releasedAt,
+          ] as const;
+        });
+
       const releaseEntry = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly reason: ProviderSessionReleaseReason;
@@ -802,29 +844,7 @@ export const layerWithOptions = (
         readonly gracefulSubscribers?: boolean;
       }) =>
         Effect.acquireUseRelease(
-          // Read the clock as the entry leaves the live map, before teardown.
-          // The old runtime's requests were created before the event pump
-          // checked this entry, and a replacement's requests come after its
-          // open, so the cutoff separates them.
-          Effect.zip(
-            Ref.modify(sessions, (current) => {
-              const key = sessionKey(input.providerSessionId);
-              const existing = current.get(key);
-              if (existing === undefined) {
-                return [Option.none<LiveSessionEntry>(), current] as const;
-              }
-              if (
-                input.onlyIfIdleGeneration !== undefined &&
-                (existing.busyCount > 0 || existing.idleGeneration !== input.onlyIfIdleGeneration)
-              ) {
-                return [Option.none<LiveSessionEntry>(), current] as const;
-              }
-              const updated = new Map(current);
-              updated.delete(key);
-              return [Option.some(existing), updated] as const;
-            }),
-            DateTime.now,
-          ),
+          removeLiveEntry(input),
           ([entry, releasedAt]) =>
             Option.match(entry, {
               onNone: () => Effect.void,

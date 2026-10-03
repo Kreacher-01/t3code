@@ -86,6 +86,11 @@ interface FlakyReleaseWrites {
   readonly failing: Ref.Ref<"none" | "session" | "session-and-requests">;
   /** Receives one item per failed write. */
   readonly failures: Queue.Queue<void>;
+  /** Holds runtime request writes: completes `paused`, then waits for `resume`. */
+  readonly pauseRequestWrites?: {
+    readonly paused: Deferred.Deferred<void>;
+    readonly resume: Deferred.Deferred<void>;
+  };
 }
 
 // Fails release writes with a defect, the way a failed SQL commit surfaces.
@@ -106,6 +111,14 @@ const makeFlakyReleaseEventSinkLayer = (flaky: FlakyReleaseWrites) =>
                   (event.payload.status === "stopped" || event.payload.status === "error")) ||
                 (failing === "session-and-requests" && event.type === "runtime-request.updated"),
             );
+            const pause = flaky.pauseRequestWrites;
+            if (
+              pause !== undefined &&
+              input.events.some((event) => event.type === "runtime-request.updated")
+            ) {
+              yield* Deferred.succeed(pause.paused, undefined);
+              yield* Deferred.await(pause.resume);
+            }
             if (!fails) return yield* delegate.write(input);
             yield* Queue.offer(flaky.failures, undefined);
             return yield* Effect.die(new Error("simulated commit failure"));
@@ -2556,6 +2569,72 @@ it.effect("ProviderSessionManagerV2 keeps each failed release's cleanup", () =>
 
       const projection = yield* projectionStore.getThreadProjection(secondThreadId);
       assert.equal(projection.runtimeRequests.at(-1)?.responseCapability.type, "not_resumable");
+    });
+
+    yield* effect.pipe(
+      Effect.provide(makeTestLayer({ state, idleTimeoutMs: 60_000, flakyReleaseWrites: flaky })),
+    );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 settles a request the event pump persists during release", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const flaky: FlakyReleaseWrites = {
+      failing: yield* Ref.make<"none" | "session" | "session-and-requests">("none"),
+      failures: yield* Queue.unbounded<void>(),
+      pauseRequestWrites: {
+        paused: yield* Deferred.make<void>(),
+        resume: yield* Deferred.make<void>(),
+      },
+    };
+    const pause = flaky.pauseRequestWrites!;
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-release-pump");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      // The runtime creates the request a moment after the release starts.
+      const createdAt = DateTime.add(now, { seconds: 1 });
+      const pendingRequest = yield* makePendingRuntimeRequestEvents({
+        idAllocator,
+        threadId,
+        providerSessionId,
+        providerThread: makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now: createdAt,
+        }),
+        now: createdAt,
+      });
+      const adapterEvents = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+      assert.isDefined(adapterEvents);
+      yield* Queue.offerAll(adapterEvents!, pendingRequest.providerEvents);
+      // The event pump holds the request permit while it persists the request.
+      yield* Deferred.await(pause.paused);
+      const closed = yield* manager
+        .close(providerSessionId)
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(pause.resume, undefined);
+      yield* Fiber.join(closed);
+
+      const projection = yield* projectionStore.getThreadProjection(threadId);
+      const request = projection.runtimeRequests.find(
+        (candidate) => candidate.id === pendingRequest.requestId,
+      );
+      assert.equal(request?.responseCapability.type, "not_resumable");
     });
 
     yield* effect.pipe(
