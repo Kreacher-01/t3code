@@ -1288,15 +1288,12 @@ export const layer: Layer.Layer<
                                         checkpointScope: input.checkpointScope,
                                         providerThread,
                                         attempt: input.attempt,
-                                        ...(input.shouldFinalizeRun === undefined
-                                          ? {}
-                                          : { shouldFinalizeRun: input.shouldFinalizeRun }),
-                                        ...(input.hasUnpairedRunInterruptRequest === undefined
-                                          ? {}
-                                          : {
-                                              hasUnpairedRunInterruptRequest:
-                                                input.hasUnpairedRunInterruptRequest,
-                                            }),
+                                        // The failure may be the ownership
+                                        // read itself, so check in the write.
+                                        writeIfRunCurrent: {
+                                          activeAttemptId: input.attempt.id,
+                                          expectedStatus: "running",
+                                        },
                                         openRunOwnedSubagents: openSubagents,
                                         terminal: makeFailedTerminalEvent(
                                           makeProviderFailure({

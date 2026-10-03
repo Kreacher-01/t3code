@@ -3273,6 +3273,25 @@ it.effect.each(["completed", "interrupted", "cancelled", "failed"] as const)(
     }),
 );
 
+it.effect("records a finished run as failed when its ownership check cannot be read", () =>
+  Effect.gen(function* () {
+    const { observed } = yield* captureRootRunTermination({
+      key: "finalize-guard-read-failure",
+      shouldFinalizeRun: () =>
+        Effect.fail(
+          new ProjectionStore.ProjectionStoreReadError({
+            threadId: ThreadId.make("thread:finalize-guard-read-failure"),
+            cause: "database unavailable",
+          }),
+        ),
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "completed")),
+    });
+    // The fallback settles through the guarded write instead of the same
+    // failing read, so the run does not stay running.
+    assert.include(observed, "run:failed");
+  }),
+);
+
 it.effect("does not refresh pull requests for auxiliary or stale provider terminals", () =>
   Effect.gen(function* () {
     const { observed } = yield* captureRootRunTermination({
@@ -3362,7 +3381,7 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
-  readonly shouldFinalizeRun: () => Effect.Effect<boolean, never>;
+  readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly seedOpenSubagent?: boolean;
   readonly events?: (

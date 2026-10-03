@@ -802,10 +802,11 @@ export const layerWithOptions = (
         readonly gracefulSubscribers?: boolean;
       }) =>
         Effect.acquireUseRelease(
-          // Read the clock before the entry leaves the live map. Requests a
-          // replacement session creates come later, so cleanup leaves them.
+          // Read the clock as the entry leaves the live map, before teardown.
+          // The old runtime's requests were created before the event pump
+          // checked this entry, and a replacement's requests come after its
+          // open, so the cutoff separates them.
           Effect.zip(
-            DateTime.now,
             Ref.modify(sessions, (current) => {
               const key = sessionKey(input.providerSessionId);
               const existing = current.get(key);
@@ -822,8 +823,9 @@ export const layerWithOptions = (
               updated.delete(key);
               return [Option.some(existing), updated] as const;
             }),
+            DateTime.now,
           ),
-          ([releasedAt, entry]) =>
+          ([entry, releasedAt]) =>
             Option.match(entry, {
               onNone: () => Effect.void,
               onSome: (entry) =>
@@ -902,7 +904,7 @@ export const layerWithOptions = (
                   }
                 }),
             }),
-          ([, entry]) =>
+          ([entry]) =>
             Option.match(entry, {
               onNone: () => Effect.void,
               onSome: (entry) =>
