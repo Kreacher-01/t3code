@@ -214,7 +214,7 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-export function webhookPath(taskId: string, token: string): string {
+function webhookPath(taskId: string, token: string): string {
   return `${WEBHOOK_ROUTE_PREFIX}/${encodeURIComponent(taskId)}/${token}`;
 }
 

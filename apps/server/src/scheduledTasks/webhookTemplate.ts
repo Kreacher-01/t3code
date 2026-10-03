@@ -63,7 +63,7 @@ function stringify(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
-export function formatWebhookRequest(request: WebhookRequest): string {
+function formatWebhookRequest(request: WebhookRequest): string {
   const headerLines = Object.entries(request.headers).map(([name, value]) => `${name}: ${value}`);
   return [
     `${request.method} ${request.path}${request.query ? `?${request.query}` : ""}`,
