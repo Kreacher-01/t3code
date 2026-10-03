@@ -65,6 +65,12 @@ export class ScheduledTaskWebhookOrigin extends Context.Reference<Effect.Effect<
   },
 ) {}
 
+interface RateWindow {
+  readonly accepted: ReadonlyArray<number>;
+  /** Whether a rejection was already logged in this window. */
+  readonly rejectedLogged: boolean;
+}
+
 export interface WebhookTriggerRequest extends WebhookRequest {
   readonly hookId: string;
   readonly token: string;
@@ -327,9 +333,7 @@ export const layer = Layer.effect(
     const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
       new Map(),
     );
-    const webhookRateWindows = yield* Ref.make<ReadonlyMap<ScheduledTaskId, ReadonlyArray<number>>>(
-      new Map(),
-    );
+    const webhookRateWindows = yield* Ref.make<ReadonlyMap<ScheduledTaskId, RateWindow>>(new Map());
     const activeRuns = yield* Ref.make<ReadonlySet<ScheduledTaskId>>(new Set());
     // Sliding(1) coalesces the dirty-signal: every notification triggers a
     // full list() re-emit anyway, so a slow subscriber only ever needs the
@@ -512,7 +516,12 @@ export const layer = Layer.effect(
           creation_source = excluded.creation_source,
           updated_at = excluded.updated_at,
           next_run_at = excluded.next_run_at,
-          webhook_token = excluded.webhook_token,
+          -- Only rotate changes a live token, so a save racing a rotation
+          -- cannot bring the old URL back.
+          webhook_token = CASE
+            WHEN excluded.webhook_token IS NULL THEN NULL
+            ELSE COALESCE(scheduled_tasks.webhook_token, excluded.webhook_token)
+          END,
           webhook_secret = excluded.webhook_secret
         RETURNING task_id
       `.pipe(
@@ -1001,7 +1010,24 @@ export const layer = Layer.effect(
       });
 
     const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(Effect.andThen(notifyChanged), Effect.as({ id: input.id }));
+      deleteRow(input.id).pipe(
+        Effect.andThen(
+          Effect.all([
+            Ref.update(webhookRateWindows, (windows) => {
+              const next = new Map(windows);
+              next.delete(input.id);
+              return next;
+            }),
+            Ref.update(webhookPermits, (permits) => {
+              const next = new Map(permits);
+              next.delete(input.id);
+              return next;
+            }),
+          ]),
+        ),
+        Effect.andThen(notifyChanged),
+        Effect.as({ id: input.id }),
+      );
 
     const runNow: ScheduledTaskService["Service"]["runNow"] = (input: ScheduledTaskRunNowInput) =>
       Effect.gen(function* () {
@@ -1154,15 +1180,34 @@ export const layer = Layer.effect(
         WHERE delivery_id = ${deliveryId}
       `.pipe(Effect.ignore);
 
-    /** Sliding one-minute window; returns false once the task is over its limit. */
+    /**
+     * Sliding one-minute window counting every request with a valid token,
+     * including ones the signature check later rejects.
+     */
     const takeRateSlot = (id: ScheduledTaskId, nowMs: number) =>
-      Ref.modify(webhookRateWindows, (windows) => {
-        const recent = (windows.get(id) ?? []).filter((at) => nowMs - at < 60_000);
-        if (recent.length >= WEBHOOK_RATE_LIMIT_PER_MINUTE) {
-          return [false, new Map(windows).set(id, recent)] as const;
-        }
-        return [true, new Map(windows).set(id, [...recent, nowMs])] as const;
-      });
+      Ref.modify(
+        webhookRateWindows,
+        (
+          windows,
+        ): readonly [
+          "allowed" | "first_rejected" | "rejected",
+          ReadonlyMap<ScheduledTaskId, RateWindow>,
+        ] => {
+          const current = windows.get(id);
+          const recent = (current?.accepted ?? []).filter((at) => nowMs - at < 60_000);
+          if (recent.length >= WEBHOOK_RATE_LIMIT_PER_MINUTE) {
+            const first = current?.rejectedLogged !== true;
+            return [
+              first ? "first_rejected" : "rejected",
+              new Map(windows).set(id, { accepted: recent, rejectedLogged: true }),
+            ];
+          }
+          return [
+            "allowed",
+            new Map(windows).set(id, { accepted: [...recent, nowMs], rejectedLogged: false }),
+          ];
+        },
+      );
 
     const webhookPermit = (id: ScheduledTaskId) =>
       Effect.gen(function* () {
@@ -1225,10 +1270,13 @@ export const layer = Layer.effect(
             signatureVerified: details.signatureVerified ?? false,
             missing: details.missing ?? [],
             renderedPrompt: details.renderedPrompt ?? null,
-          }).pipe(Effect.andThen(notifyChanged));
+          });
 
-        if (!(yield* takeRateSlot(task.id, DateTime.toEpochMillis(receivedAt)))) {
-          yield* log("rate_limited");
+        // Only the first rejected request in a window is logged, so a flood
+        // cannot write rows or push the real deliveries out of the log.
+        const slot = yield* takeRateSlot(task.id, DateTime.toEpochMillis(receivedAt));
+        if (slot !== "allowed") {
+          if (slot === "first_rejected") yield* log("rate_limited");
           return { _tag: "rate_limited" as const };
         }
         if (!task.enabled) {
@@ -1265,7 +1313,6 @@ export const layer = Layer.effect(
               : Effect.void,
           ),
           Effect.catchCause((cause) => markDeliveryFailed(deliveryId, errorMessage(cause))),
-          Effect.andThen(notifyChanged),
           permit.withPermits(1),
           Effect.forkIn(serviceScope),
         );

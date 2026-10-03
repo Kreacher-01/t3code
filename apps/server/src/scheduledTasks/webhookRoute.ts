@@ -1,6 +1,8 @@
+import * as ByteSize from "effect/ByteSize";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as HttpIncomingMessage from "effect/unstable/http/HttpIncomingMessage";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
@@ -29,16 +31,27 @@ const handleWebhook = (scheduledTasks: ScheduledTaskService["Service"]) =>
       .slice(`${WEBHOOK_ROUTE_PREFIX}/`.length)
       .split("/");
     if (!hookId || !token || rest.length > 0) return json(404, { error: "hook_not_found" });
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(hookId);
+    } catch {
+      return json(404, { error: "hook_not_found" });
+    }
 
     const contentLength = Number(request.headers["content-length"] ?? "0");
     if (!Number.isFinite(contentLength) || contentLength > WEBHOOK_MAX_BODY_BYTES) {
       return json(413, { error: "body_too_large" });
     }
+    // Chunked requests carry no content-length, so the reader itself is capped.
     const body = yield* request.arrayBuffer.pipe(
       Effect.map((buffer) => new Uint8Array(buffer)),
+      Effect.provideService(
+        HttpIncomingMessage.MaxBodySize,
+        ByteSize.bytes(WEBHOOK_MAX_BODY_BYTES),
+      ),
       Effect.option,
     );
-    if (Option.isNone(body)) return json(400, { error: "unreadable_body" });
+    if (Option.isNone(body)) return json(413, { error: "body_too_large_or_unreadable" });
     if (body.value.byteLength > WEBHOOK_MAX_BODY_BYTES)
       return json(413, { error: "body_too_large" });
 
@@ -49,7 +62,7 @@ const handleWebhook = (scheduledTasks: ScheduledTaskService["Service"]) =>
 
     const result = yield* scheduledTasks
       .triggerWebhook({
-        hookId: decodeURIComponent(hookId),
+        hookId: taskId,
         token,
         method: request.method,
         path: `${WEBHOOK_ROUTE_PREFIX}/${hookId}`,

@@ -249,6 +249,25 @@ it.effect("rate limits a hook past 60 deliveries a minute", () =>
       );
       assert.equal(results.at(-2)?._tag, "disabled");
       assert.equal(results.at(-1)?._tag, "rate_limited");
+      // Further rejections in the same window are counted, not logged.
+      yield* Effect.forEach([1, 2, 3], () => service.triggerWebhook(requestFor(task)));
+      const outcomes = (yield* service.listWebhookDeliveries({ id: task.id })).deliveries.map(
+        (delivery) => delivery.outcome,
+      );
+      assert.equal(outcomes.filter((outcome) => outcome === "rate_limited").length, 1);
+    }),
+  ),
+);
+
+it.effect("a save carrying a stale token cannot undo a rotation", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* webhookTaskInput());
+      const rotated = yield* service.rotateWebhookToken({ id: task.id });
+      // The editor was opened before the rotation and saves afterwards.
+      const saved = yield* service.upsert(yield* webhookTaskInput({ title: "Edited" }));
+      assert.equal(saved.task.webhook?.path, rotated.task.webhook?.path);
+      assert.equal((yield* service.triggerWebhook(requestFor(task)))._tag, "not_found");
     }),
   ),
 );

@@ -88,6 +88,25 @@ describe("webhook route", () => {
       expect((await handler(post("/api/hooks/id/tok", big))).status).toBe(413);
       expect((await handler(post("/api/hooks/id", "{}"))).status).toBe(404);
       expect((await handler(post("/api/hooks/id/tok/extra", "{}"))).status).toBe(404);
+      expect((await handler(post("/api/hooks/%E0/tok", "{}"))).status).toBe(404);
+      // No content-length: the reader cap must still apply.
+      const chunked = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let sent = 0; sent <= WEBHOOK_MAX_BODY_BYTES; sent += 64 * 1024) {
+            controller.enqueue(new Uint8Array(64 * 1024));
+          }
+          controller.close();
+        },
+      });
+      const streamed = await handler(
+        new Request("http://env.local/api/hooks/id/tok", {
+          method: "POST",
+          body: chunked,
+          // @ts-expect-error Node's fetch needs duplex for streamed bodies.
+          duplex: "half",
+        }),
+      );
+      expect(streamed.status).toBe(413);
       expect(calls).toBe(0);
     } finally {
       await dispose();
