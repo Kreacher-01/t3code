@@ -105,15 +105,22 @@ function isSameKeybindingRule(left: KeybindingRule, right: KeybindingRule): bool
 }
 
 // Default rules added to a command after startup sync had already persisted
-// that command. Backfill skips commands a config already has, so startup
-// appends each rule here once per config and records its id. A user who later
-// removes the rule keeps it removed.
+// that command. Backfill skips commands a config already has, so startup adds
+// each rule once per config, only next to the untouched earlier default
+// (`alongside`), and records its id. Customized commands and later removals
+// stay as the user set them.
 const LATE_DEFAULT_KEYBINDINGS: ReadonlyArray<{
   readonly id: string;
+  readonly alongside: KeybindingRule;
   readonly rule: KeybindingRule;
 }> = [
   {
     id: "composer.sendBackground:mod+enter",
+    alongside: {
+      key: "mod+alt+enter",
+      command: "composer.sendBackground",
+      when: "composerFocus && draftThreadRoute",
+    },
     rule: {
       key: "mod+enter",
       command: "composer.sendBackground",
@@ -551,10 +558,10 @@ const make = Effect.gen(function* () {
         missingDefaults.push(defaultRule);
       }
       // The loop above backfills whole missing commands. Late defaults join
-      // commands the config already has, when their shortcut is still free.
-      for (const { rule } of pendingLateDefaults) {
+      // an untouched earlier default, when their shortcut is still free.
+      for (const { alongside, rule } of pendingLateDefaults) {
         if (
-          existingCommands.has(rule.command) &&
+          customConfig.some((entry) => isSameKeybindingRule(entry, alongside)) &&
           !customConfig.some((entry) => hasSameShortcutContext(entry, rule))
         ) {
           missingDefaults.push(rule);
