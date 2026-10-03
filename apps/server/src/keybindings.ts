@@ -426,21 +426,22 @@ const make = Effect.gen(function* () {
     Effect.map((contents) => new Set(contents.split("\n").filter((line) => line.length > 0))),
     Effect.orElseSucceed(() => new Set<string>()),
   );
-  const recordAppliedMigrations = writeFileStringAtomically({
-    filePath: appliedMigrationsPath,
-    contents: `${LATE_DEFAULT_KEYBINDINGS.map((late) => late.id).join("\n")}\n`,
-  }).pipe(
-    Effect.provideService(FileSystem.FileSystem, fs),
-    Effect.provideService(Path.Path, path),
-    Effect.mapError(
-      (cause) =>
-        new KeybindingsConfigError({
-          configPath: keybindingsConfigPath,
-          detail: "failed to record keybinding migrations",
-          cause,
-        }),
-    ),
-  );
+  const recordAppliedMigrations = (ids: Iterable<string>) =>
+    writeFileStringAtomically({
+      filePath: appliedMigrationsPath,
+      contents: `${[...new Set(ids)].join("\n")}\n`,
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.provideService(Path.Path, path),
+      Effect.mapError(
+        (cause) =>
+          new KeybindingsConfigError({
+            configPath: keybindingsConfigPath,
+            detail: "failed to record keybinding migrations",
+            cause,
+          }),
+      ),
+    );
 
   const writeConfigAtomically = (rules: readonly KeybindingRule[]) => {
     return encodeKeybindingsConfigPrettyJson(rules).pipe(
@@ -500,7 +501,12 @@ const make = Effect.gen(function* () {
       const configExists = yield* readConfigExists;
       if (!configExists) {
         yield* writeConfigAtomically(DEFAULT_KEYBINDINGS);
-        if (pendingLateDefaults.length > 0) yield* recordAppliedMigrations;
+        if (pendingLateDefaults.length > 0) {
+          yield* recordAppliedMigrations([
+            ...appliedMigrationIds,
+            ...LATE_DEFAULT_KEYBINDINGS.map((late) => late.id),
+          ]);
+        }
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
@@ -593,7 +599,16 @@ const make = Effect.gen(function* () {
       if (defaultsToAppend.length > 0) {
         yield* writeConfigAtomically([...customConfig, ...defaultsToAppend]);
       }
-      if (pendingLateDefaults.length > 0) yield* recordAppliedMigrations;
+      // A late default skipped at max entries stays pending for a later start.
+      const settledLateDefaults = pendingLateDefaults.filter(
+        (late) => !skippedDefaults.includes(late.rule),
+      );
+      if (settledLateDefaults.length > 0) {
+        yield* recordAppliedMigrations([
+          ...appliedMigrationIds,
+          ...settledLateDefaults.map((late) => late.id),
+        ]);
+      }
       yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
     }),
   );
