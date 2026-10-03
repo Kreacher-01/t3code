@@ -2017,6 +2017,24 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "scheduledTasks",
             "scheduled_task.id": input.id,
           }),
+        [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.scheduledTasksRotateWebhookToken,
+            scheduledTasks.rotateWebhookToken(input),
+            { "rpc.aggregate": "scheduledTasks", "scheduled_task.id": input.id },
+          ),
+        [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.scheduledTasksListWebhookDeliveries,
+            scheduledTasks.listWebhookDeliveries(input),
+            { "rpc.aggregate": "scheduledTasks", "scheduled_task.id": input.id },
+          ),
+        [WS_METHODS.scheduledTasksGetWebhookDelivery]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.scheduledTasksGetWebhookDelivery,
+            scheduledTasks.getWebhookDelivery(input),
+            { "rpc.aggregate": "scheduledTasks", "scheduled_task.id": input.id },
+          ),
         [WS_METHODS.serverProbe]: (_input) =>
           observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
             "rpc.aggregate": "server",
